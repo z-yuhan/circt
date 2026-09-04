@@ -423,6 +423,13 @@ static LogicalResult doHLSFlowCalyx(
   // Lower to Calyx
   addIRLevel(IRLevel::Core, [&]() {
     pm.addPass(circt::createSCFToCalyxPass(topLevelFunction));
+    // SCFToCalyx leaves datapath cell clk/reset inputs unconnected, and the
+    // generated SystemVerilog then ties them to 1'bz (never clocked). Wire
+    // every cell's clk/reset inputs to the component ports before lowering.
+    // (Go insertion is NOT wanted here: CalyxToFSM errors on pre-existing
+    // calyx.group_go ops, and the FSM path generates its own go signals.)
+    pm.nest<calyx::ComponentOp>().addPass(calyx::createClkInsertionPass());
+    pm.nest<calyx::ComponentOp>().addPass(calyx::createResetInsertionPass());
   });
 
   // Run Calyx transforms
