@@ -1,5 +1,6 @@
 add_circt_dialect_library(CIRCTCalyxTransforms
   CompileControl.cpp
+  CompileRepeat.cpp
   GICM.cpp
   GoInsertion.cpp
   ClkResetInsertion.cpp

@@ -423,6 +423,11 @@ static LogicalResult doHLSFlowCalyx(
   // Lower to Calyx
   addIRLevel(IRLevel::Core, [&]() {
     pm.addPass(circt::createSCFToCalyxPass(topLevelFunction));
+    // SCFToCalyx emits `calyx.repeat` for `scf.for` loops, but CalyxToFSM
+    // cannot compile repeat control. Lower it to while loops with a trip
+    // counter here, before the clk/reset insertion below so the registers
+    // created by the lowering get wired up as well.
+    pm.nest<calyx::ComponentOp>().addPass(calyx::createCompileRepeatPass());
     // SCFToCalyx leaves datapath cell clk/reset inputs unconnected, and the
     // generated SystemVerilog then ties them to 1'bz (never clocked). Wire
     // every cell's clk/reset inputs to the component ports before lowering.

@@ -39,6 +39,18 @@ def ClkInsertion : Pass<"calyx-clk-insertion", "calyx::ComponentOp"> {
   let constructor = "circt::calyx::createClkInsertionPass()";
 }
 
+def CompileRepeat : Pass<"calyx-compile-repeat", "calyx::ComponentOp"> {
+  let summary = "Lower calyx.repeat loops to while loops with a trip counter.";
+  let description = [{
+    Lowers `calyx.repeat` control into an equivalent `calyx.while` loop driven
+    by a dedicated trip counter. CalyxToFSM supports `while` but not `repeat`,
+    so designs produced from `scf.for` (emitted as `calyx.repeat` by
+    SCFToCalyx) cannot be compiled to RTL without this lowering.
+  }];
+  let dependentDialects = ["hw::HWDialect"];
+  let constructor = "circt::calyx::createCompileRepeatPass()";
+}
+
 def ResetInsertion : Pass<"calyx-reset-insertion", "calyx::ComponentOp"> {
   let summary = "Connect component reset to sub-component reset for applicable components.";
   let description = "";
