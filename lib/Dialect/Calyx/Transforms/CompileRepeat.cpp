@@ -34,7 +34,6 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/StringSet.h"
-#include "llvm/Support/MathExtras.h"
 
 namespace circt {
 namespace calyx {
@@ -117,9 +116,9 @@ private:
     MLIRContext *ctx = builder.getContext();
     // The counter is incremented after the last iteration, so it must be wide
     // enough to hold `count` itself.
-    unsigned width = count == 1
-                         ? 1
-                         : 64 - llvm::countLeadingZeros(uint64_t(count));
+    unsigned width = 1;
+    while ((uint64_t(1) << width) <= uint64_t(count))
+      ++width;
     auto intType = IntegerType::get(ctx, width);
     auto i1Type = builder.getI1Type();
     std::string u = reserveNames();
@@ -194,10 +193,8 @@ private:
 
       auto outerSeq = calyx::SeqOp::create(builder, loc);
       builder.setInsertionPointToStart(outerSeq.getBodyBlock());
-      calyx::EnableOp::create(builder, loc,
-                              FlatSymbolRefAttr::get(ctx, u + "_init"));
-      calyx::EnableOp::create(builder, loc,
-                              FlatSymbolRefAttr::get(ctx, u + "_cond"));
+      calyx::EnableOp::create(builder, loc, u + "_init");
+      calyx::EnableOp::create(builder, loc, u + "_cond");
 
       auto whileOp = calyx::WhileOp::create(builder, loc, condReg.getOut(),
                                             FlatSymbolRefAttr());
@@ -207,10 +204,8 @@ private:
       for (auto &bodyOp : llvm::make_early_inc_range(*op.getBodyBlock()))
         bodyOp.moveBefore(innerBody, innerBody->end());
       builder.setInsertionPointToEnd(innerBody);
-      calyx::EnableOp::create(builder, loc,
-                              FlatSymbolRefAttr::get(ctx, u + "_incr"));
-      calyx::EnableOp::create(builder, loc,
-                              FlatSymbolRefAttr::get(ctx, u + "_cond"));
+      calyx::EnableOp::create(builder, loc, u + "_incr");
+      calyx::EnableOp::create(builder, loc, u + "_cond");
 
       op.erase();
     }
