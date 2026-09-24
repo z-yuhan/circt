@@ -1,4 +1,5 @@
 // RUN: circt-opt --llhd-lower-timed-processes %s | FileCheck %s
+// RUN: circt-opt --llhd-lower-timed-processes --canonicalize %s | FileCheck %s --check-prefix=CANON
 
 // CHECK-LABEL: hw.module @counter
 hw.module @counter(in %clk : i1, out count : i2) {
@@ -72,6 +73,51 @@ hw.module @hold_counter(in %clk : i1, in %enable : i1, out count : i2) {
   ^bb1(%state : i2):
     llhd.wait yield (%state : i2), (%clk : i1), ^bb2(%clk : i1)
   ^bb2(%previousClock : i1):
+    %notPrevious = comb.xor %previousClock, %true : i1
+    %edge = comb.and %notPrevious, %clk : i1
+    %update = comb.and %edge, %enable : i1
+    cf.cond_br %update, ^bb3, ^bb1(%state : i2)
+  ^bb3:
+    %incremented = comb.add %state, %one : i2
+    cf.br ^bb1(%incremented : i2)
+  }
+  llhd.drv %signal, %0 after %time : i2
+  %observed = llhd.prb %signal : i2
+  hw.output %observed : i2
+}
+
+// The destination operands of `llhd.wait` are filled in by `llhd-mem2reg` while
+// walking a liveness set, so their order relative to `observed` carries no
+// contract and may differ from the sensitivity-list order that produced
+// `observed`.  The lowering must therefore not pair the two lists positionally.
+//
+// This module is `@hold_counter` with the destination operands reversed.  It
+// must lower to the same counter.
+//
+// Before the fix the previous-value inversion was skipped for both operands,
+// which turned the clock-edge term `!previous & current` into `!current &
+// current`.  Canonicalization then folds the whole process into a frozen
+// register, and every sequential update is silently dropped.
+// CANON-LABEL: hw.module @hold_counter_reversed_wait_order
+// CANON: %[[TO_CLOCK:.+]] = seq.to_clock %clk
+// CANON: %[[ENABLE:.+]] = comb.and %clk, %enable : i1
+// CANON: %[[REG:.+]] = seq.compreg %[[NEXT:.+]], %[[TO_CLOCK]] : i2
+// CANON: %[[INC:.+]] = comb.add %[[REG]], %{{.+}} : i2
+// CANON: %[[NEXT]] = comb.mux %[[ENABLE]], %[[INC]], %[[REG]] : i2
+// CANON: hw.output %[[REG]] : i2
+hw.module @hold_counter_reversed_wait_order(in %clk : i1, in %reset : i1,
+                                            in %enable : i1, out count : i2) {
+  %zero = hw.constant 0 : i2
+  %one = hw.constant 1 : i2
+  %true = hw.constant true
+  %time = llhd.constant_time <0ns, 1d, 0e>
+  %signal = llhd.sig %zero : i2
+  %0:1 = llhd.process -> i2 {
+    cf.br ^bb1(%zero : i2)
+  ^bb1(%state : i2):
+    // Note the reversed destination operands.
+    llhd.wait yield (%state : i2), (%clk, %reset : i1, i1), ^bb2(%reset, %clk : i1, i1)
+  ^bb2(%previousReset : i1, %previousClock : i1):
     %notPrevious = comb.xor %previousClock, %true : i1
     %edge = comb.and %notPrevious, %clk : i1
     %update = comb.and %edge, %enable : i1
