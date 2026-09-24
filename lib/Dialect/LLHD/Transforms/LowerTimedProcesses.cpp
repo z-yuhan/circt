@@ -30,6 +30,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
 namespace circt {
@@ -453,11 +454,14 @@ static Value lowerProcess(llhd::ProcessOp process,
       }
     }
     if (&block == dest) {
-      // Dest block arguments carry the values observed by the wait.
-      for (auto indexed : llvm::enumerate(
-               llvm::zip(block.getArguments(), wait.getDestOperands()))) {
-        auto [arg, value] = indexed.value();
-        size_t index = indexed.index();
+      // Dest block arguments carry the values observed by the wait.  Do not
+      // pair them with `getObserved()` by position: the destination operands
+      // are filled in by `llhd-mem2reg` while walking a liveness set, so their
+      // order relative to the sensitivity list that produced `getObserved()`
+      // carries no contract and may legitimately differ.  Match by value
+      // identity instead.
+      for (auto [arg, value] :
+           llvm::zip(block.getArguments(), wait.getDestOperands())) {
         Value replacement = value;
         // ImportVerilog passes an observed i1 both as a wait sensitivity and
         // as a destination operand.  The block argument denotes its value
@@ -466,8 +470,8 @@ static Value lowerProcess(llhd::ProcessOp process,
         // this edge-triggered process.  Mapping both to the same SSA value
         // turns `!previous & current` into `!current & current` and silently
         // disables every sequential update.
-        if (index < wait.getObserved().size() &&
-            wait.getObserved()[index] == value && value.getType().isInteger(1)) {
+        if (value.getType().isInteger(1) &&
+            llvm::is_contained(wait.getObserved(), value)) {
           builder.setInsertionPoint(process);
           replacement = comb::XorOp::create(builder, loc, value,
                                             constTrue(builder, loc), true);
