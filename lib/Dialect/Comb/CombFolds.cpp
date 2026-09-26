@@ -2324,6 +2324,22 @@ static bool foldCommonMuxValue(MuxOp op, bool isTrueOperand,
     if (subMux == op)
       return false;
 
+    // Convergence guard -- LOCAL WORKAROUND, not an upstream fix.
+    //
+    // This sub-case combines the two mux conditions into `cond | subCond`.  If
+    // the mux already carries such a combined condition, combining again does
+    // not converge: on the DSC encoder module `dsce_bpvector` this fired
+    // 623,203 times in 6 seconds with unbounded IR growth, and the greedy
+    // rewriter never reached a fixpoint (the process eventually died with
+    // OOM).  Measured with `--debug-only=greedy-rewriter` plus an instrumented
+    // matchAndRewrite.
+    //
+    // Only combine such a condition once.  Conservative: it skips an
+    // optimization instead of miscompiling, and it restores convergence.
+    // Only this sub-case is guarded -- the `x|y|z|a` fold below is untouched.
+    if (dyn_cast_or_null<OrOp>(op.getCond().getDefiningOp()))
+      return false;
+
     Value otherValue;
     Value subCond = subMux.getCond();
 
