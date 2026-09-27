@@ -16,6 +16,7 @@
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Dialect/Sim/SimDialect.h"
+#include "circt/Dialect/Sim/SimOps.h"
 #include "circt/Dialect/SystemC/SystemCOps.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
@@ -1453,6 +1454,28 @@ struct ConvertFirReg : public OpConversionPattern<seq::FirRegOp> {
   }
 };
 
+/// `sim.print` is debug output for CIRCT's own `sim` runtime.  The generated
+/// SystemC model does not run that runtime, and the op's `clock` operand is a
+/// `!seq.clock`, which cannot survive the type conversion (`clock` becomes i1,
+/// and `systemc.convert` cannot turn it back).  Drop the op.
+struct ConvertPrintFormattedOp
+    : public OpConversionPattern<sim::PrintFormattedOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(sim::PrintFormattedOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // The format literal exists only to be consumed by print ops, so it becomes
+    // dead together with this print.  Erase it as well: `sim.fmt.literal` is
+    // legal, and a dead one would otherwise survive into ExportSystemC.
+    Operation *format = op.getInput().getDefiningOp();
+    rewriter.eraseOp(op);
+    if (format && isa<sim::FormatLiteralOp>(format) && format->use_empty())
+      rewriter.eraseOp(format);
+    return success();
+  }
+};
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -1466,6 +1489,12 @@ static void populateLegality(ConversionTarget &target) {
   target.addLegalDialect<comb::CombDialect>();
   target.addLegalDialect<emitc::EmitCDialect>();
   target.addLegalDialect<sim::SimDialect>();
+  // `sim.print` is debug output for CIRCT's own `sim` runtime, which the
+  // generated SystemC model does not run, and its `clock` operand is a
+  // `!seq.clock` (the type converter maps that to i1).  Leaving the op in place
+  // forces an i1 -> !seq.clock source materialization, and `systemc.convert`
+  // cannot produce `!seq.clock`.  Handle it explicitly instead.
+  target.addIllegalOp<sim::PrintFormattedOp>();
   target.addIllegalDialect<seq::SeqDialect>();
   target.addLegalOp<hw::ConstantOp>();
   // Extern leaves are retained as Verilator/SystemC black boxes. They are
@@ -1482,7 +1511,8 @@ static void populateOpConversion(RewritePatternSet &patterns,
            ConvertClockCast<seq::ToClockOp>,
            ConvertClockCast<seq::FromClockOp>, ConvertCompReg<seq::CompRegOp>,
            ConvertCompReg<seq::CompRegClockEnabledOp>, ConvertFirReg,
-           ConvertFirMem, ConvertFirMemRead, ConvertFirMemWrite>(
+           ConvertFirMem, ConvertFirMemRead, ConvertFirMemWrite,
+           ConvertPrintFormattedOp>(
           typeConverter, patterns.getContext());
 }
 
@@ -1528,10 +1558,19 @@ static void populateTypeConversion(TypeConverter &converter) {
       [](seq::FirMemType type) -> Type { return getMemoryStorageType(type); });
 
   converter.addSourceMaterialization(
-      [](OpBuilder &builder, Type type, ValueRange values, Location loc) {
+      [](OpBuilder &builder, Type type, ValueRange values,
+         Location loc) -> Value {
         assert(values.size() == 1);
-        auto op = ConvertOp::create(builder, loc, type, values[0]);
-        return op.getResult();
+        // `systemc.convert` only accepts integers and SystemC value types
+        // (see ConvertOp's definition).  Refuse anything else -- notably
+        // `!seq.clock`, which the conversion above maps to i1 -- instead of
+        // building an op that later fails verification with a much less
+        // actionable message about `systemc.convert`'s result type.
+        // Returning a null Value signals that materialization failed.
+        if (!type.isIntOrIndex() &&
+            type.getDialect().getNamespace() != "systemc")
+          return Value();
+        return ConvertOp::create(builder, loc, type, values[0]).getResult();
       });
 
   converter.addTargetMaterialization(
