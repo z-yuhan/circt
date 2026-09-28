@@ -30,6 +30,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -51,34 +52,42 @@ static Value constTrue(OpBuilder &builder, Location loc) {
 
 /// Compute, for every block reachable from the wait dest, an i1 value
 /// encoding the condition under which the block is entered.
+///
+/// A block's condition is the OR over its incoming edges of
+/// `condition(predecessor) && edge condition`.  Merging each edge into the
+/// target as it is discovered is not enough: when a target's condition grows
+/// after it has already been processed, its successors keep the condition
+/// derived from the predecessor that happened to be visited first, and the
+/// whole downstream region is under-approximated.  That reaches the state
+/// registers - their update path is the loop back to the wait block - and
+/// shows up as a register that only updates on one of its update paths, e.g. a
+/// FIFO write pointer that advances only while its input is *not* valid.
+///
+/// Visit the blocks so that predecessors come before successors and rebuild
+/// each condition from all of its incoming edges instead.
 struct BlockConditions {
   LogicalResult compute(Block *waitBlock, Block *dest, OpBuilder &builder,
                         Location loc) {
+    cond.clear();
     cond[dest] = constTrue(builder, loc);
-    SmallVector<Block *> worklist{dest};
-    while (!worklist.empty()) {
-      Block *block = worklist.pop_back_val();
-      if (block == waitBlock)
-        continue;
-      auto condBr = dyn_cast<cf::CondBranchOp>(block->getTerminator());
-      if (!condBr) {
-        if (auto br = dyn_cast<cf::BranchOp>(block->getTerminator())) {
-          if (br.getDest() != waitBlock)
-            merge(br.getDest(), cond[block], worklist);
-        }
-        continue;
+
+    SmallVector<Block *> order;
+    bool cyclic = false;
+    llvm::SmallDenseSet<Block *, 8> visiting, visited;
+    collect(dest, waitBlock, order, visiting, visited, cyclic);
+    std::reverse(order.begin(), order.end());
+
+    // One pass is exact on an acyclic region.  A process body may contain a
+    // loop, in which case the information has to travel around it again, so
+    // iterate a bounded number of extra times.
+    unsigned rounds = cyclic ? std::min<unsigned>(order.size(), 8) : 1;
+    for (unsigned round = 0; round < rounds; ++round)
+      for (Block *block : order) {
+        if (block == dest || block == waitBlock)
+          continue;
+        if (Value rebuilt = rebuild(block, waitBlock, builder, loc))
+          cond[block] = rebuilt;
       }
-      Value notCond = comb::XorOp::create(builder, loc, condBr.getCondition(),
-                                          constTrue(builder, loc), true);
-      merge(condBr.getTrueDest(),
-            comb::AndOp::create(builder, loc, cond[block], condBr.getCondition(),
-                                true),
-            worklist);
-      if (condBr.getFalseDest() != waitBlock)
-        merge(condBr.getFalseDest(),
-              comb::AndOp::create(builder, loc, cond[block], notCond, true),
-              worklist);
-    }
     return success();
   }
 
@@ -88,15 +97,65 @@ struct BlockConditions {
   }
 
 private:
-  void merge(Block *target, Value newCond, SmallVectorImpl<Block *> &worklist) {
-    auto it = cond.find(target);
-    if (it == cond.end()) {
-      cond[target] = newCond;
-      worklist.push_back(target);
+  /// Reverse post-order walk from `dest` that does not cross the wait block.
+  void collect(Block *block, Block *waitBlock,
+               SmallVectorImpl<Block *> &order,
+               llvm::SmallDenseSet<Block *, 8> &visiting,
+               llvm::SmallDenseSet<Block *, 8> &visited, bool &cyclic) {
+    if (block == waitBlock || !visited.insert(block).second)
       return;
+    visiting.insert(block);
+    for (Block *successor : block->getSuccessors()) {
+      if (successor == waitBlock)
+        continue;
+      if (visiting.contains(successor))
+        cyclic = true;
+      else
+        collect(successor, waitBlock, order, visiting, visited, cyclic);
     }
-    OpBuilder b(target, target->begin());
-    it->second = comb::OrOp::create(b, b.getUnknownLoc(), it->second, newCond, true);
+    visiting.erase(block);
+    order.push_back(block);
+  }
+
+  /// OR over every incoming edge of `block`, excluding edges from the wait
+  /// block (the loop back to the wait carries the state, not control flow).
+  Value rebuild(Block *block, Block *waitBlock, OpBuilder &builder,
+                Location loc) {
+    Value result;
+    auto add = [&](Value term) {
+      result =
+          result ? comb::OrOp::create(builder, loc, result, term, true) : term;
+    };
+    for (Block *predecessor : block->getPredecessors()) {
+      if (predecessor == waitBlock)
+        continue;
+      Value predecessorCondition = cond.lookup(predecessor);
+      if (!predecessorCondition)
+        continue;
+      auto branch = dyn_cast<cf::CondBranchOp>(predecessor->getTerminator());
+      if (!branch) {
+        add(predecessorCondition);
+        continue;
+      }
+      bool isTrueDest = branch.getTrueDest() == block;
+      bool isFalseDest = branch.getFalseDest() == block;
+      // Both arms reaching this block means `c | !c`, which is unconditional.
+      if (isTrueDest && isFalseDest) {
+        add(predecessorCondition);
+        continue;
+      }
+      if (isTrueDest)
+        add(comb::AndOp::create(builder, loc, predecessorCondition,
+                                branch.getCondition(), true));
+      if (isFalseDest) {
+        Value notCondition =
+            comb::XorOp::create(builder, loc, branch.getCondition(),
+                                constTrue(builder, loc), true);
+        add(comb::AndOp::create(builder, loc, predecessorCondition, notCondition,
+                                true));
+      }
+    }
+    return result;
   }
 
   DenseMap<Block *, Value> cond;
