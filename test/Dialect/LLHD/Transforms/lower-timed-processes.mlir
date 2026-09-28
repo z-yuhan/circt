@@ -130,3 +130,42 @@ hw.module @hold_counter_reversed_wait_order(in %clk : i1, in %reset : i1,
   %observed = llhd.prb %signal : i2
   hw.output %observed : i2
 }
+
+// A conditional branch is allowed to use the same block for both destinations:
+//   cf.cond_br %c, ^bb(%a), ^bb(%b)
+// That is a single predecessor with *two* edges, and the two arms carry
+// different operands.  Both edges have to be materialized.  The lowering used
+// to report only the true arm, which silently dropped the increment selected on
+// the other arm; the counter then held its value, and canonicalization deleted
+// the now-dead `comb.add`.  The surviving add after canonicalization is
+// therefore the fingerprint of this bug.
+// CANON-LABEL: hw.module @branch_same_destination
+// CANON: %[[REG:.+]] = seq.compreg %{{.+}}, %{{.+}} : i2
+// CANON: %[[INC:.+]] = comb.add %[[REG]], %{{.+}} : i2
+// CANON: hw.output %[[REG]] : i2
+hw.module @branch_same_destination(in %clk : i1, in %reset : i1,
+                                   out count : i2) {
+  %zero = hw.constant 0 : i2
+  %one = hw.constant 1 : i2
+  %true = hw.constant true
+  %time = llhd.constant_time <0ns, 1d, 0e>
+  %signal = llhd.sig %zero : i2
+  %0:1 = llhd.process -> i2 {
+    cf.br ^bb1(%zero : i2)
+  ^bb1(%state : i2):
+    llhd.wait yield (%state : i2), (%clk : i1), ^bb2(%clk : i1)
+  ^bb2(%previousClock : i1):
+    %notPrevious = comb.xor %previousClock, %true : i1
+    %edge = comb.and %notPrevious, %clk : i1
+    cf.cond_br %edge, ^bb3, ^bb1(%state : i2)
+  ^bb3:
+    %incremented = comb.add %state, %one : i2
+    // Same successor on both arms, with different operands.
+    cf.cond_br %reset, ^bb4(%state : i2), ^bb4(%incremented : i2)
+  ^bb4(%next : i2):
+    cf.br ^bb1(%next : i2)
+  }
+  llhd.drv %signal, %0 after %time : i2
+  %observed = llhd.prb %signal : i2
+  hw.output %observed : i2
+}
