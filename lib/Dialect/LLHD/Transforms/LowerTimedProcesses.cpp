@@ -107,36 +107,44 @@ struct DriveInfo {
   Value condition;
 };
 
-static std::optional<std::pair<Value, ValueRange>>
-getIncomingEdge(Block *predecessor, Block *target, OpBuilder &builder,
-                Location loc, const BlockConditions &blockConds) {
+/// Collect every edge from `predecessor` to `target`.  A conditional branch is
+/// allowed to use the same block for both destinations, as in
+/// `cf.cond_br %c, ^bb(%x), ^bb(%y)`.  That is a single predecessor with *two*
+/// edges, and the two arms carry different operand lists; both have to be
+/// modelled.  Reporting only the true arm silently drops the value selected on
+/// the other arm - e.g. the `+1` update of a counter - which degenerates the
+/// state into a hold.  The two arms' conditions are mutually exclusive, so
+/// their relative order in the resulting mux tree does not matter.
+static void getIncomingEdges(
+    Block *predecessor, Block *target, OpBuilder &builder, Location loc,
+    const BlockConditions &blockConds,
+    SmallVectorImpl<std::pair<Value, ValueRange>> &incoming) {
   Value predecessorCondition = blockConds.getCondition(predecessor);
   if (!predecessorCondition)
-    return std::nullopt;
+    return;
   if (auto branch = dyn_cast<cf::BranchOp>(predecessor->getTerminator())) {
-    if (branch.getDest() != target)
-      return std::nullopt;
-    return std::make_pair(predecessorCondition, branch.getDestOperands());
+    if (branch.getDest() == target)
+      incoming.push_back({predecessorCondition, branch.getDestOperands()});
+    return;
   }
   auto branch = dyn_cast<cf::CondBranchOp>(predecessor->getTerminator());
   if (!branch)
-    return std::nullopt;
+    return;
   if (branch.getTrueDest() == target)
-    return std::make_pair(
-        comb::AndOp::create(builder, loc, predecessorCondition,
-                            branch.getCondition(), true)
-            .getResult(),
-        branch.getTrueDestOperands());
+    incoming.push_back(
+        {comb::AndOp::create(builder, loc, predecessorCondition,
+                             branch.getCondition(), true)
+             .getResult(),
+         branch.getTrueDestOperands()});
   if (branch.getFalseDest() == target) {
     Value notCondition = comb::XorOp::create(
         builder, loc, branch.getCondition(), constTrue(builder, loc), true);
-    return std::make_pair(
-        comb::AndOp::create(builder, loc, predecessorCondition, notCondition,
-                            true)
-            .getResult(),
-        branch.getFalseDestOperands());
+    incoming.push_back(
+        {comb::AndOp::create(builder, loc, predecessorCondition, notCondition,
+                             true)
+             .getResult(),
+         branch.getFalseDestOperands()});
   }
-  return std::nullopt;
 }
 
 static LogicalResult replaceIntermediateBlockArguments(
@@ -149,9 +157,7 @@ static LogicalResult replaceIntermediateBlockArguments(
       continue;
     SmallVector<std::pair<Value, ValueRange>> incoming;
     for (Block *predecessor : block.getPredecessors())
-      if (auto edge =
-              getIncomingEdge(predecessor, &block, builder, loc, blockConds))
-        incoming.push_back(*edge);
+      getIncomingEdges(predecessor, &block, builder, loc, blockConds, incoming);
     if (incoming.empty())
       return process.emitOpError("intermediate block has no incoming value");
     for (auto argument : llvm::enumerate(block.getArguments())) {
@@ -191,9 +197,7 @@ static LogicalResult lowerCombinational(
       continue;
     SmallVector<std::pair<Value, ValueRange>> incoming;
     for (Block *predecessor : block.getPredecessors())
-      if (auto edge =
-              getIncomingEdge(predecessor, &block, builder, loc, blockConds))
-        incoming.push_back(*edge);
+      getIncomingEdges(predecessor, &block, builder, loc, blockConds, incoming);
     if (incoming.empty())
       return combinational.emitOpError(
           "combinational block has no incoming value");
