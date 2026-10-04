@@ -390,54 +390,50 @@ static Value lowerProcess(llhd::ProcessOp process,
     }
 
     SmallVector<std::pair<Value, Value>> paths;
+    auto readOperand = [&](ValueRange operands) -> std::optional<Value> {
+      // The frontend emits branches with inconsistent operand lists: some
+      // carry one operand per yield position, some one per block argument,
+      // and some drop operands. Map by argument position when the counts
+      // line up; when the branch carries fewer operands than block
+      // arguments, the missing states hold their value.
+      if (operands.size() == numState)
+        return operands[argIdx];
+      if (operands.size() > numState && yieldIdx < operands.size())
+        return operands[yieldIdx];
+      return std::nullopt;
+    };
     for (Block *pred : waitBlock->getPredecessors()) {
       if (pred->isEntryBlock())
         continue;
-      Value cond = blockConds.getCondition(pred);
-      Value value;
-      auto readOperand = [&](ValueRange operands) -> std::optional<Value> {
-        // The frontend emits branches with inconsistent operand lists: some
-        // carry one operand per yield position, some one per block argument,
-        // and some drop operands. Map by argument position when the counts
-        // line up; when the branch carries fewer operands than block
-        // arguments, the missing states hold their value.
-        if (operands.size() == numState)
-          return operands[argIdx];
-        if (operands.size() > numState && yieldIdx < operands.size())
-          return operands[yieldIdx];
-        return std::nullopt;
-      };
-      if (auto br = dyn_cast<cf::BranchOp>(pred->getTerminator())) {
-        auto v = readOperand(br.getDestOperands());
-        if (!v) {
-          process.emitOpError("branch operand count mismatch");
-          return {};
-        }
-        value = *v;
-      } else if (auto condBr =
-                     dyn_cast<cf::CondBranchOp>(pred->getTerminator())) {
-        auto v = readOperand(condBr.getTrueDest() == waitBlock
-                                 ? condBr.getTrueDestOperands()
-                                 : condBr.getFalseDestOperands());
-        if (!v) {
-          process.emitOpError("branch operand count mismatch");
-          return {};
-        }
-        value = *v;
-      } else {
-        process.emitOpError("unexpected predecessor terminator");
-        return {};
-      }
-      if (!cond) {
+      if (!blockConds.getCondition(pred)) {
         process.emitOpError("unexpected predecessor structure");
         return {};
       }
-      // Passing the wait block argument back to itself is an explicit hold,
-      // not a data update.  Record it without a value so the register output
-      // becomes the default arm of the final next-state mux chain.
-      if (value == waitBlock->getArgument(argIdx))
-        value = {};
-      paths.push_back({cond, value});
+      // A conditional branch may name the wait block for both destinations.
+      // That is one predecessor carrying two edges with different operands and
+      // complementary conditions, so take every edge - reporting only the true
+      // arm drops the update selected by the other one, exactly like the
+      // intermediate-block merge above.
+      SmallVector<std::pair<Value, ValueRange>> edges;
+      getIncomingEdges(pred, waitBlock, builder, loc, blockConds, edges);
+      if (edges.empty()) {
+        process.emitOpError("unexpected predecessor terminator");
+        return {};
+      }
+      for (auto &[edgeCondition, operands] : edges) {
+        auto v = readOperand(operands);
+        if (!v) {
+          process.emitOpError("branch operand count mismatch");
+          return {};
+        }
+        Value value = *v;
+        // Passing the wait block argument back to itself is an explicit hold,
+        // not a data update.  Record it without a value so the register output
+        // becomes the default arm of the final next-state mux chain.
+        if (value == waitBlock->getArgument(argIdx))
+          value = {};
+        paths.push_back({edgeCondition, value});
+      }
     }
     if (paths.empty()) {
       process.emitOpError("no state update path found");
