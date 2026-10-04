@@ -220,3 +220,39 @@ hw.module @merge_paths(in %clk : i1, in %reset : i1, in %enable : i1,
   %observed = llhd.prb %signal : i2
   hw.output %observed : i2
 }
+
+// The wait block itself can be the target of *both* arms of a conditional
+// branch as well.  That is once more a single predecessor with two edges
+// carrying different next states, one level up from
+// `@branch_same_destination`: there the merge was for an intermediate block,
+// here it is for the state handed to `llhd.wait` directly.  Reading only the
+// true arm throws the incremental update away, and the counter degenerates
+// into "reset or hold" - the same failure as a dropped FIFO write.
+// CANON-LABEL: hw.module @branch_to_wait_block
+// CANON: %[[REG:.+]] = seq.compreg %{{.+}}, %{{.+}} : i2
+// CANON: %[[INC:.+]] = comb.add %[[REG]], %{{.+}} : i2
+// CANON: hw.output %[[REG]] : i2
+hw.module @branch_to_wait_block(in %clk : i1, in %reset : i1,
+                                out count : i2) {
+  %zero = hw.constant 0 : i2
+  %one = hw.constant 1 : i2
+  %true = hw.constant true
+  %time = llhd.constant_time <0ns, 1d, 0e>
+  %signal = llhd.sig %zero : i2
+  %0:1 = llhd.process -> i2 {
+    cf.br ^bb1(%zero : i2)
+  ^bb1(%state : i2):
+    llhd.wait yield (%state : i2), (%clk : i1), ^bb2(%clk : i1)
+  ^bb2(%previousClock : i1):
+    %notPrevious = comb.xor %previousClock, %true : i1
+    %edge = comb.and %notPrevious, %clk : i1
+    cf.cond_br %edge, ^bb3, ^bb1(%state : i2)
+  ^bb3:
+    %incremented = comb.add %state, %one : i2
+    // Same successor on both arms, with different operands.
+    cf.cond_br %reset, ^bb1(%zero : i2), ^bb1(%incremented : i2)
+  }
+  llhd.drv %signal, %0 after %time : i2
+  %observed = llhd.prb %signal : i2
+  hw.output %observed : i2
+}
