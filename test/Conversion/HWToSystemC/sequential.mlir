@@ -113,3 +113,30 @@ hw.module @feedback_counter(in %clk: i1, in %reset: i1, out value: i8) {
 // CHECK: %[[NEXT_SC:.*]] = systemc.convert %[[NEXT_INT]] : (i8) -> !systemc.uint<8>
 // CHECK: "systemc.register.write"(%[[STATE_SIGNAL]], %[[NEXT_SC]], %clk, %true, {{.*}}, {{.*}}) <{isAsync = false}>
 // CHECK-NOT: seq.
+
+// -----
+
+// `sim.print` is debug output for CIRCT's own `sim` runtime, which the generated
+// SystemC model does not run.  Its `clock` operand is a `!seq.clock`, a type the
+// conversion turns into i1, so leaving the op in place forces an
+// i1 -> !seq.clock source materialization that `systemc.convert` cannot produce.
+// The print has to be dropped, and the format literal with it: it exists only to
+// feed this print, and a dead one would otherwise survive into ExportSystemC.
+hw.module @print(in %clk: i1, in %reset: i1, in %enable: i1, in %next: i8,
+                 out value: i8) {
+  %clock = seq.to_clock %clk
+  %zero = hw.constant 0 : i8
+  %true = hw.constant true
+  %value = seq.compreg.ce name "value" %next, %clock, %enable
+      reset %reset, %zero : i8
+  %format = sim.fmt.literal "value: "
+  sim.print %format on %clock if %true
+  hw.output %value : i8
+}
+
+// CHECK-LABEL: systemc.module @print
+// CHECK-NOT: sim.
+// CHECK-NOT: seq.
+// CHECK: %value_state = systemc.signal : !systemc.signal<!systemc.uint<8>>
+// CHECK: "systemc.register.write"(%value_state, {{.*}}) <{isAsync = false}>
+
