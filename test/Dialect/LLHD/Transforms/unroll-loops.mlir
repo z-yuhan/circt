@@ -563,3 +563,46 @@ hw.module @NestedLoopWithNonConstantInnerBound(in %a: i42, out x : i42) {
   }
   hw.output %0 : i42
 }
+
+// A sequential process body can contain a loop as well.  It has to be unrolled
+// here just like a combinational one: `llhd-lower-timed-processes` later
+// linearizes the process body into straight-line SSA, so a statically bounded
+// loop that survives until then becomes a genuine combinational SSA cycle
+// instead of the unrolled network.  The loop below reads and writes `%x` before
+// suspending, so the resumed value must be the result of the third iteration.
+// CHECK-LABEL: @ProcessLoop
+hw.module @ProcessLoop(in %clk : i1, out x : i42) {
+  %c0_i42 = hw.constant 0 : i42
+  %c1_i42 = hw.constant 1 : i42
+  %c3_i42 = hw.constant 3 : i42
+  %c42_i42 = hw.constant 42 : i42
+  %t = llhd.constant_time <1ns, 0d, 0e>
+  %sig = llhd.sig %c0_i42 : i42
+  // Loop of the form:
+  //   x = 0
+  //   for (i = 0; i < 3; ++i)
+  //     x += 42
+  %0:1 = llhd.process -> i42 {
+    // CHECK: llhd.process
+    // CHECK: [[X1:%.+]] = comb.add {{%.+}}, %c42_i42 : i42
+    // CHECK-NEXT: [[X2:%.+]] = comb.add [[X1]], %c42_i42 : i42
+    // CHECK-NEXT: [[X3:%.+]] = comb.add [[X2]], %c42_i42 : i42
+    // CHECK: llhd.wait yield ([[X3]] : i42)
+    // CHECK: llhd.halt [[X3]] : i42
+    cf.br ^header(%c0_i42, %c0_i42 : i42, i42)
+  ^header(%i: i42, %x: i42):
+    %1 = comb.icmp slt %i, %c3_i42 : i42
+    cf.cond_br %1, ^body, ^exit
+  ^body:
+    %2 = comb.add %x, %c42_i42 : i42
+    %ip = comb.add %i, %c1_i42 : i42
+    cf.br ^header(%ip, %2 : i42, i42)
+  ^exit:
+    llhd.wait yield (%x : i42), (%clk : i1), ^resume(%clk : i1)
+  ^resume(%previousClock: i1):
+    llhd.halt %x : i42
+  }
+  llhd.drv %sig, %0 after %t : i42
+  %1 = llhd.prb %sig : i42
+  hw.output %1 : i42
+}
