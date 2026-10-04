@@ -169,3 +169,54 @@ hw.module @branch_same_destination(in %clk : i1, in %reset : i1,
   %observed = llhd.prb %signal : i2
   hw.output %observed : i2
 }
+
+// A block reached by more than one path has to take its condition from *all* of
+// its incoming edges.  Merging each edge into the block as it is discovered is
+// not enough: the condition grows, but a block that was already processed does
+// not seed its successors again, so they keep the condition derived from the
+// first edge alone and the rest of the region is under-approximated.  Here
+// `^bb6` is reached through the reset path and through the enabled path, and
+// its successor `^bb7` forwards the value to the wait block, so the stale
+// condition decides when the register is rewritten.
+// CHECK-LABEL: hw.module @merge_paths
+// The update condition of `^bb7` is the OR over both paths into `^bb6`,
+// `(edge && reset) || (edge && !reset && enable)`, instead of either one alone.
+// CHECK: %[[EDGE:.+]] = comb.and {{.*}}, %clk : i1
+// CHECK-DAG: %[[ENABLE_ARM:.+]] = comb.and {{.*}}, %enable : i1
+// CHECK-DAG: %[[RESET_ARM:.+]] = comb.and {{.*}}, %reset : i1
+// CHECK: %[[UPDATE:.+]] = comb.or {{(bin )?}}{{.*}}, {{.*}} : i1
+// Both paths drive the next state - reset loads zero, the enabled path
+// increments - and taking neither holds the current value.
+// CHECK: %[[ZERO:.+]] = comb.mux {{.*}}, %c0_i2, {{.*}} : i2
+// CHECK: %[[REG:.+]] = seq.compreg %[[NEXT:.+]], {{.*}} : i2
+// CHECK: [[NEXT]] = comb.mux %[[UPDATE]], %[[ZERO]], %[[REG]] : i2
+// CHECK: hw.output %[[REG]] : i2
+hw.module @merge_paths(in %clk : i1, in %reset : i1, in %enable : i1,
+                       out count : i2) {
+  %zero = hw.constant 0 : i2
+  %one = hw.constant 1 : i2
+  %true = hw.constant true
+  %time = llhd.constant_time <0ns, 1d, 0e>
+  %signal = llhd.sig %zero : i2
+  %0:1 = llhd.process -> i2 {
+    cf.br ^bb1(%zero : i2)
+  ^bb1(%state : i2):
+    llhd.wait yield (%state : i2), (%clk : i1), ^bb2(%clk : i1)
+  ^bb2(%previousClock : i1):
+    %notPrevious = comb.xor %previousClock, %true : i1
+    %edge = comb.and %notPrevious, %clk : i1
+    cf.cond_br %edge, ^bb3, ^bb1(%state : i2)
+  ^bb3:
+    cf.cond_br %reset, ^bb5, ^bb6(%zero : i2)
+  ^bb5:
+    %incremented = comb.add %state, %one : i2
+    cf.cond_br %enable, ^bb6(%incremented : i2), ^bb1(%state : i2)
+  ^bb6(%next : i2):
+    cf.br ^bb7(%next : i2)
+  ^bb7(%value : i2):
+    cf.br ^bb1(%value : i2)
+  }
+  llhd.drv %signal, %0 after %time : i2
+  %observed = llhd.prb %signal : i2
+  hw.output %observed : i2
+}
