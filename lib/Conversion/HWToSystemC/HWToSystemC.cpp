@@ -891,27 +891,14 @@ public:
       StringAttr signalName = rewriter.getStringAttr(
           instanceName.getValue() + "_" + orderedPort.info.name.getValue());
 
-      // Look through materialized conversions and unrealized casts to
-      // recover the read of the channel this input is fed from.
-      Operation *definingOp = input.getDefiningOp();
-      while (definingOp && (isa<ConvertOp>(definingOp) ||
-                            isa<UnrealizedConversionCastOp>(definingOp)))
-        definingOp = definingOp->getOperand(0).getDefiningOp();
-
-      if (auto readOp = dyn_cast_or_null<SignalReadOp>(definingOp)) {
-        // Use the read channel directly without adding an intermediate
-        // signal, unless the channel is a module input port itself. In that
-        // case keep the explicit signal so that the port-to-instance data
-        // path is visible in the module body.
-        if (!llvm::is_contained(scModule.getArguments(), readOp.getInput())) {
-          rewriter.restoreInsertionPoint(initInsertPt);
-          BindPortOp::create(rewriter, loc, instDecl, portId,
-                             readOp.getInput());
-          continue;
-        }
-      }
-
-      // Otherwise, create an intermediate signal to bind the instance port to.
+      // Always bind the port to an intermediate signal that this module's
+      // update function writes.  Assigning the value to a signal costs one
+      // delta cycle, so the instance observes the values that were stable
+      // before the clock edge -- exactly the values hardware samples.  Binding
+      // the source channel directly (a shortcut we deliberately do not take)
+      // would let the instance sample the state this module's registers just
+      // updated to, which silently merges one pipeline stage per instance
+      // boundary; on memories that shows up as a one-cycle-off read address.
       Type sigType =
           SignalType::get(getSignalBaseType(orderedPort.info.type));
       rewriter.restoreInsertionPoint(stateInsertPt);
