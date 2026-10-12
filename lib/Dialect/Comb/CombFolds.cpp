@@ -2285,6 +2285,20 @@ static Value extractOperandFromFullyAssociative(Operation *fullyAssoc,
   return opWithoutExcluded;
 }
 
+/// Return true if `needle` is `haystack` itself or a leaf of an `or` tree
+/// rooted at `haystack`.  Used to detect that combining two conditions would
+/// not add anything because one already contains the other.
+static bool conditionContains(Value haystack, Value needle) {
+  if (haystack == needle)
+    return true;
+  auto orOp = haystack.getDefiningOp<OrOp>();
+  if (!orOp)
+    return false;
+  return llvm::any_of(orOp.getInputs(), [&](Value input) {
+    return conditionContains(input, needle);
+  });
+}
+
 /// Fold things like `mux(cond, x|y|z|a, a)` -> `(x|y|z)&replicate(cond)|a` and
 /// `mux(cond, a, x|y|z|a) -> `(x|y|z)&replicate(~cond) | a` (when isTrueOperand
 /// is true.  Return true on successful transformation, false if not.
@@ -2324,22 +2338,6 @@ static bool foldCommonMuxValue(MuxOp op, bool isTrueOperand,
     if (subMux == op)
       return false;
 
-    // Convergence guard -- LOCAL WORKAROUND, not an upstream fix.
-    //
-    // This sub-case combines the two mux conditions into `cond | subCond`.  If
-    // the mux already carries such a combined condition, combining again does
-    // not converge: on the DSC encoder module `dsce_bpvector` this fired
-    // 623,203 times in 6 seconds with unbounded IR growth, and the greedy
-    // rewriter never reached a fixpoint (the process eventually died with
-    // OOM).  Measured with `--debug-only=greedy-rewriter` plus an instrumented
-    // matchAndRewrite.
-    //
-    // Only combine such a condition once.  Conservative: it skips an
-    // optimization instead of miscompiling, and it restores convergence.
-    // Only this sub-case is guarded -- the `x|y|z|a` fold below is untouched.
-    if (dyn_cast_or_null<OrOp>(op.getCond().getDefiningOp()))
-      return false;
-
     Value otherValue;
     Value subCond = subMux.getCond();
 
@@ -2354,10 +2352,20 @@ static bool foldCommonMuxValue(MuxOp op, bool isTrueOperand,
       return false;
     }
 
-    // Invert the outer cond if needed, and combine the mux conditions.
+    // Invert the outer cond if needed, and combine the mux conditions.  When
+    // one side already contains the other, the combination would add nothing
+    // and the fold would apply again to the mux it just built: on the DSC
+    // encoder's `dsce_bpvector` the condition grew by one `comb.or` per
+    // iteration until canonicalize died with an out-of-memory error.  Refuse
+    // just that case instead of refusing to combine any condition that happens
+    // to be an `or`, which also skips folds that do reach a fixpoint.
+    Value outerCond = cond;
     if (!isTrueOperand)
-      cond = createOrFoldNot(rewriter, op.getLoc(), cond);
-    cond = rewriter.createOrFold<OrOp>(op.getLoc(), cond, subCond, false);
+      outerCond = createOrFoldNot(rewriter, op.getLoc(), outerCond);
+    if (conditionContains(outerCond, subCond) ||
+        conditionContains(subCond, outerCond))
+      return false;
+    cond = rewriter.createOrFold<OrOp>(op.getLoc(), outerCond, subCond, false);
     replaceOpWithNewOpAndCopyNamehint<MuxOp>(rewriter, op, cond, commonValue,
                                              otherValue, op.getTwoState());
     return true;
