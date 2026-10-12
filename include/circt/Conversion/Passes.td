@@ -598,6 +598,16 @@ def ConvertHWToSystemC : Pass<"convert-hw-to-systemc", "mlir::ModuleOp"> {
   let summary = "Convert HW to SystemC";
   let description = [{
     This pass translates a HW design into an equivalent SystemC design.
+
+    The `sim` dialect's debug and control operations (`sim.print`,
+    `sim.clocked_terminate`, `sim.clocked_pause`, `sim.triggered`) are written
+    for CIRCT's own `sim` runtime, which the generated SystemC model does not
+    run.  They also take a `!seq.clock` operand, a type this conversion maps to
+    `i1`, so a surviving op forces a source materialization that
+    `systemc.convert` cannot build.  By default they are dropped, with one
+    warning per dropped op; the model then simply runs to completion instead of
+    printing or terminating early.  Pass `drop-debug-ops=false` to turn the
+    warning into an error, so a design that relies on them fails loudly.
   }];
   let constructor = "circt::createConvertHWToSystemCPass()";
   let options = [
@@ -608,6 +618,10 @@ def ConvertHWToSystemC : Pass<"convert-hw-to-systemc", "mlir::ModuleOp"> {
       "Compatibility option: the conversion pass consumes prepared scalar "
       "HW. Use --lower-hw-to-systemc for automatic aggregate preparation, or "
       "prepare explicitly before inserting interop instances.">,
+    Option<"dropDebugOps", "drop-debug-ops", "bool", "true",
+      "Drop `sim` runtime debug/control ops (sim.print and friends) instead of "
+      "failing. They cannot be represented in the generated SystemC model, "
+      "which does not run the `sim` runtime.">,
   ];
   let dependentDialects = ["systemc::SystemCDialect", "mlir::emitc::EmitCDialect",
                            "seq::SeqDialect"];

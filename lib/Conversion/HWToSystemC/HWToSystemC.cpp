@@ -1441,27 +1441,55 @@ struct ConvertFirReg : public OpConversionPattern<seq::FirRegOp> {
   }
 };
 
-/// `sim.print` is debug output for CIRCT's own `sim` runtime.  The generated
-/// SystemC model does not run that runtime, and the op's `clock` operand is a
-/// `!seq.clock`, which cannot survive the type conversion (`clock` becomes i1,
-/// and `systemc.convert` cannot turn it back).  Drop the op.
-struct ConvertPrintFormattedOp
-    : public OpConversionPattern<sim::PrintFormattedOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(sim::PrintFormattedOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    // The format literal exists only to be consumed by print ops, so it becomes
-    // dead together with this print.  Erase it as well: `sim.fmt.literal` is
-    // legal, and a dead one would otherwise survive into ExportSystemC.
-    Operation *format = op.getInput().getDefiningOp();
-    rewriter.eraseOp(op);
-    if (format && isa<sim::FormatLiteralOp>(format) && format->use_empty())
-      rewriter.eraseOp(format);
+/// Drop the `sim` runtime's debug and control operations.
+///
+/// `sim.print` and friends are written for CIRCT's own `sim` runtime, which the
+/// generated SystemC model does not run.  They also carry a `!seq.clock`
+/// operand - a type this conversion maps to `i1` - so a surviving op forces an
+/// `i1 -> !seq.clock` source materialization, and `systemc.convert` cannot
+/// produce `!seq.clock`.  Previously such an op simply failed the conversion
+/// with a message about `systemc.convert`'s result type; now they are either
+/// dropped (with a warning, one per op) or reported as an error, depending on
+/// the `drop-debug-ops` option.
+///
+/// `sim.print` is the common case and is dropped because losing a print only
+/// costs observability.  `sim.clocked_terminate` / `sim.clocked_pause` /
+/// `sim.triggered` change simulation control, so dropping them is also
+/// announced; a testbench that relies on them will run past its intended end.
+static LogicalResult handleSimDebugOps(ModuleOp module, bool dropOps) {
+  SmallVector<Operation *> doomed;
+  module.walk([&](Operation *op) {
+    if (isa<sim::PrintFormattedOp, sim::ClockedTerminateOp,
+            sim::ClockedPauseOp, sim::TriggeredOp>(op))
+      doomed.push_back(op);
+  });
+  if (doomed.empty())
     return success();
+
+  if (!dropOps) {
+    Operation *op = doomed.front();
+    return op->emitError()
+           << "the generated SystemC model does not run CIRCT's `sim` runtime, "
+              "so this operation cannot be converted; drop it beforehand or "
+              "rerun with drop-debug-ops=true";
   }
-};
+
+  for (Operation *op : doomed) {
+    // The format literal exists only to be consumed by print ops, so it becomes
+    // dead together with the print.  Erase it as well: `sim.fmt.literal` is
+    // legal, and a dead one would otherwise survive into ExportSystemC.
+    Operation *format =
+        isa<sim::PrintFormattedOp>(op) ? op->getOperand(0).getDefiningOp()
+                                       : nullptr;
+    op->emitWarning()
+        << "dropping `sim` debug/control operation: the generated SystemC "
+           "model does not run CIRCT's `sim` runtime";
+    op->erase();
+    if (format && isa<sim::FormatLiteralOp>(format) && format->use_empty())
+      format->erase();
+  }
+  return success();
+}
 
 } // namespace
 
@@ -1476,12 +1504,13 @@ static void populateLegality(ConversionTarget &target) {
   target.addLegalDialect<comb::CombDialect>();
   target.addLegalDialect<emitc::EmitCDialect>();
   target.addLegalDialect<sim::SimDialect>();
-  // `sim.print` is debug output for CIRCT's own `sim` runtime, which the
-  // generated SystemC model does not run, and its `clock` operand is a
-  // `!seq.clock` (the type converter maps that to i1).  Leaving the op in place
-  // forces an i1 -> !seq.clock source materialization, and `systemc.convert`
-  // cannot produce `!seq.clock`.  Handle it explicitly instead.
+  // `sim` debug/control ops are handled up front by `handleSimDebugOps`: they
+  // cannot be converted, and leaving them legal would let one survive into the
+  // output and fail later in ExportSystemC.
   target.addIllegalOp<sim::PrintFormattedOp>();
+  target.addIllegalOp<sim::ClockedTerminateOp>();
+  target.addIllegalOp<sim::ClockedPauseOp>();
+  target.addIllegalOp<sim::TriggeredOp>();
   target.addIllegalDialect<seq::SeqDialect>();
   target.addLegalOp<hw::ConstantOp>();
   // Extern leaves are retained as Verilator/SystemC black boxes. They are
@@ -1498,8 +1527,7 @@ static void populateOpConversion(RewritePatternSet &patterns,
            ConvertClockCast<seq::ToClockOp>,
            ConvertClockCast<seq::FromClockOp>, ConvertCompReg<seq::CompRegOp>,
            ConvertCompReg<seq::CompRegClockEnabledOp>, ConvertFirReg,
-           ConvertFirMem, ConvertFirMemRead, ConvertFirMemWrite,
-           ConvertPrintFormattedOp>(
+           ConvertFirMem, ConvertFirMemRead, ConvertFirMemWrite>(
           typeConverter, patterns.getContext());
 }
 
@@ -1632,6 +1660,11 @@ void HWToSystemCPass::runOnOperation() {
   // (mlir's remove-dead-values pass is not used here: it would replace the
   // uses of dead values with ub.poison, which the SystemC flow doesn't
   // support.)
+  if (failed(handleSimDebugOps(module, dropDebugOps))) {
+    signalPassFailure();
+    return;
+  }
+
   bool changed = true;
   while (changed) {
     changed = false;
