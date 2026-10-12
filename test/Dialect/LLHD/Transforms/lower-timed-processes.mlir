@@ -86,6 +86,49 @@ hw.module @hold_counter(in %clk : i1, in %enable : i1, out count : i2) {
   hw.output %observed : i2
 }
 
+// A branch may say "this state is not written on this path" by pairing a
+// don't-care value with a constant-false enable, instead of feeding the wait
+// block argument back to itself.  The enable is what decides, because the
+// don't-care is indistinguishable from a legitimate zero when read on its own.
+//
+// This is the shape of the DSC encoder's rate buffer: the read data register is
+// written only while the read enable is high, and the branch that does not read
+// passes `(%c0_i2, %false)`.  Taking that zero as an update clears the register,
+// which erases the value the following beat replays.  The register has to feed
+// back its own value on every holding edge, which is what the `comb.mux` over
+// `%[[REG]]` pins down: without the fix the low arm supplies the don't-care
+// `%c0_i2` instead.
+// CHECK-LABEL: hw.module @hold_dont_care_pair
+// CHECK: %[[REG:.+]] = seq.compreg %[[NEXT:.+]], %{{.+}} : i2
+// CHECK: %[[NEXT]] = comb.mux {{.+}}, {{.+}}, %{{.+}} : i2
+// CHECK: hw.output %[[REG]] : i2
+hw.module @hold_dont_care_pair(in %clk : i1, in %enable : i1, in %next : i2,
+                               out count : i2) {
+  %zero = hw.constant 0 : i2
+  %false = hw.constant false
+  %true = hw.constant true
+  %time = llhd.constant_time <0ns, 1d, 0e>
+  %signal = llhd.sig %zero : i2
+  // The state is carried as a (value, enable) pair: `%state` with `%stateEna`.
+  %0:2 = llhd.process -> i2, i1 {
+    cf.br ^bb1(%zero, %false : i2, i1)
+  ^bb1(%state : i2, %stateEna : i1):
+    llhd.wait yield (%state, %stateEna : i2, i1), (%clk : i1), ^bb2(%clk : i1)
+  ^bb2(%previousClock : i1):
+    %notPrevious = comb.xor %previousClock, %true : i1
+    %edge = comb.and %notPrevious, %clk : i1
+    // The enabled edge carries the new value next to a true enable; the edge
+    // that is not taken carries a don't-care zero next to a constant-false one.
+    cf.cond_br %edge, ^bb3, ^bb1(%next, %true : i2, i1)
+  ^bb3:
+    cf.cond_br %enable, ^bb1(%next, %true : i2, i1),
+                     ^bb1(%zero, %false : i2, i1)
+  }
+  llhd.drv %signal, %0#0 after %time : i2
+  %observed = llhd.prb %signal : i2
+  hw.output %observed : i2
+}
+
 // The destination operands of `llhd.wait` are filled in by `llhd-mem2reg` while
 // walking a liveness set, so their order relative to `observed` carries no
 // contract and may differ from the sensitivity-list order that produced

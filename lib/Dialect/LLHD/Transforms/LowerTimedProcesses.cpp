@@ -390,17 +390,22 @@ static Value lowerProcess(llhd::ProcessOp process,
     }
 
     SmallVector<std::pair<Value, Value>> paths;
-    auto readOperand = [&](ValueRange operands) -> std::optional<Value> {
-      // The frontend emits branches with inconsistent operand lists: some
-      // carry one operand per yield position, some one per block argument,
-      // and some drop operands. Map by argument position when the counts
-      // line up; when the branch carries fewer operands than block
-      // arguments, the missing states hold their value.
-      if (operands.size() == numState)
-        return operands[argIdx];
-      if (operands.size() > numState && yieldIdx < operands.size())
-        return operands[yieldIdx];
-      return std::nullopt;
+    // The frontend expresses "this state is not written on this path" with a
+    // don't-care value next to a constant-false enable: every state occupies two
+    // wait block arguments, the value and an i1 companion, and that companion is
+    // what says whether the state is updated at all.  On the DSC encoder's rate
+    // buffer the branch that does not read passes `(%c0_i192, %false)` for the
+    // read data, so reading the value unconditionally loads a zero into the
+    // register and erases the word replayed on the following beat.
+    //
+    // Only the constant-false companion is treated as a hold: that is a positive
+    // marker, unlike the shape of the surrounding mux, and it leaves every other
+    // state on every other path untouched.
+    auto hasFalseEnable = [&](ValueRange operands, size_t enableIdx) {
+      if (enableIdx >= operands.size())
+        return false;
+      auto enable = operands[enableIdx].getDefiningOp<hw::ConstantOp>();
+      return enable && enable.getValue().isZero();
     };
     for (Block *pred : waitBlock->getPredecessors()) {
       if (pred->isEntryBlock())
@@ -421,16 +426,29 @@ static Value lowerProcess(llhd::ProcessOp process,
         return {};
       }
       for (auto &[edgeCondition, operands] : edges) {
-        auto v = readOperand(operands);
-        if (!v) {
+        Value value;
+        // A state that is carried as a (value, enable) pair sits in two slots,
+        // and the state's own yield position is the value slot; its companion
+        // enable follows right after.  An edge says "this state is not written
+        // here" either by pairing a don't-care with a constant-false enable, or
+        // by carrying too few operands for this state at all; both are holds,
+        // and neither is a data update, so the register output becomes the
+        // default arm of the final next-state mux chain.  Everything else has
+        // to name a value.
+        size_t operandIdx = operands.size() == numState ? argIdx : yieldIdx;
+        if (operands.size() != numState && operands.size() <= numState) {
           process.emitOpError("branch operand count mismatch");
           return {};
         }
-        Value value = *v;
-        // Passing the wait block argument back to itself is an explicit hold,
-        // not a data update.  Record it without a value so the register output
-        // becomes the default arm of the final next-state mux chain.
-        if (value == waitBlock->getArgument(argIdx))
+        if (operandIdx >= operands.size()) {
+          process.emitOpError("branch operand count mismatch");
+          return {};
+        }
+        if (!hasFalseEnable(operands, operandIdx + 1))
+          value = operands[operandIdx];
+        // Passing the wait block argument back to itself is also an explicit
+        // hold, not a data update.
+        if (value && value == waitBlock->getArgument(argIdx))
           value = {};
         paths.push_back({edgeCondition, value});
       }
