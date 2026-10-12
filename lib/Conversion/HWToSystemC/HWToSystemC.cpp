@@ -1642,6 +1642,43 @@ void circt::registerHWToSystemCPipeline() {
       });
 }
 
+/// Check the timing invariant this conversion relies on: every instance *input*
+/// port is bound to an intermediate signal owned by this module, never directly
+/// to another instance's output channel.
+///
+/// Binding an input port straight to a sibling's output channel removes the one
+/// delta cycle that assigning to a signal costs, so the instance would observe
+/// state the parent updated in the same cycle.  On the DSC encoder that merged
+/// one pipeline stage per instance boundary and put the PPS SRAM read address
+/// one cycle ahead of the slot it was latched into, which shifted the whole
+/// 128-byte configuration by one byte and produced a nearly empty bitstream.
+/// Pinning the invariant here means a future "this signal looks redundant"
+/// cleanup fails loudly instead of silently changing the model's timing.
+static LogicalResult verifyInstanceInputBindings(ModuleOp module) {
+  for (auto scModule : module.getOps<systemc::SCModuleOp>()) {
+    for (auto bind : scModule.getOps<systemc::BindPortOp>()) {
+      auto moduleType =
+          dyn_cast<systemc::ModuleType>(bind.getInstance().getType());
+      if (!moduleType)
+        continue;
+      auto portId = bind.getPortIdAttr();
+      if (portId.getInt() >= (int64_t)moduleType.getPorts().size())
+        continue;
+      if (!isa<systemc::InputType>(moduleType.getPorts()[portId.getInt()].type))
+        continue;
+      // `systemc.instance.bind_port` accepts a channel type on both sides, so
+      // the direction alone does not tell us whether a signal sits here.
+      if (isa<systemc::SignalType>(bind.getChannel().getType()))
+        continue;
+      return bind.emitOpError()
+             << "instance input port must be bound to a signal owned by this "
+                "module: binding it directly to another channel removes the "
+                "delta cycle the hardware model depends on";
+    }
+  }
+  return success();
+}
+
 /// This is the main entrypoint for the HW to SystemC conversion pass.
 void HWToSystemCPass::runOnOperation() {
   MLIRContext &context = getContext();
@@ -1702,4 +1739,9 @@ void HWToSystemCPass::runOnOperation() {
   }
 
   materializeCombValues(module);
+
+  if (failed(verifyInstanceInputBindings(module))) {
+    signalPassFailure();
+    return;
+  }
 }
